@@ -1,0 +1,16 @@
+services:
+  music-mcp:
+    build:
+      context: .
+    container_name: music-mcp
+    ports:
+      - "8001:8001"
+    env_file: .env
+    volumes:
+      - music-tmp:/tmp/music-mcp
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  music-tmp:
