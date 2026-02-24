@@ -18,7 +18,7 @@ Exposes tools over HTTP via [mcpo](https://github.com/open-webui/mcpo).
 ### 1. Clone & configure
 
 ```bash
-git clone https://github.com/yourname/vk-music-assistant.git
+git clone https://github.com/dmitrydvornichenko/vk-music-assistant.git
 cd vk-music-assistant
 cp .env.example .env
 # edit .env — at minimum set VK_TOKEN
