@@ -1,7 +1,7 @@
 # vk-music-assistant
 
 MCP server that searches and plays music from VK Audio.  
-Exposes tools over HTTP via [mcpo](https://github.com/open-webui/mcpo), compatible with Open WebUI, Claude Desktop, and any OpenAI-tool-calling LLM.
+Exposes tools over HTTP via [mcpo](https://github.com/open-webui/mcpo).
 
 ## Tools
 
@@ -26,7 +26,7 @@ cp .env.example .env
 
 ---
 
-### Option A — local run (no Docker)
+### Run locally
 
 Prerequisites: Python 3.11+, `ffmpeg`, `paplay` (pulseaudio-utils).
 
@@ -48,12 +48,12 @@ The OpenAPI-compatible endpoint is available at `http://localhost:8001`.
 
 ---
 
-### Option B — Docker
+### Run in Docker
 
 The container plays audio through the **host** PulseAudio daemon.  
 Set `PULSE_SERVER` in `.env` to point to your PulseAudio instance and mount any required sockets yourself.
 
-**Linux (Unix socket example)**
+**Linux (Unix socket)**
 
 ```
 PULSE_SERVER=unix:/tmp/pulse-native
@@ -64,6 +64,13 @@ Mount the host socket into the container by extending `docker-compose.yml` with 
 volumes:
   - /run/user/1000/pulse/native:/tmp/pulse-native:ro
 ```
+
+**Linux (TCP)**
+
+```
+PULSE_SERVER=localhost:4713
+```
+Make sure to enable TCP in PulseAudio in `/etc/pulse/default.pa`
 
 **Windows / macOS (TCP)**
 
@@ -96,15 +103,77 @@ See [`.env.example`](.env.example) for all options.
 | `MODE` | `stream` | Playback mode: `stream` or `file` |
 | `TEMP_DIR` | `/tmp/music-mcp` | Temp dir for downloaded files (`file` mode) |
 
+---
+
 ## Test script
 
-`test_tool_loop.py` — manual tool-calling loop that talks directly to a local llama-server + mcpo:
+`test_tool_loop.py` — manual tool-calling loop that talks to an LLM + mcpo.  
+Supports **local llama-server** and any major cloud provider.
+
+### LLM environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_PROVIDER` | `local` | `local` · `openai` · `anthropic` · `openrouter` · `ollama` · `custom` |
+| `LLM_API_KEY` | — | API key (required for cloud providers) |
+| `LLM_URL` | *(auto)* | Override base URL; useful for custom/self-hosted endpoints |
+| `LLM_MODEL` | `gpt-oss-20b-Q4_K_M.gguf` | Model name |
+| `MCPO_URL` | `http://localhost:8001` | mcpo endpoint |
+
+Default base URLs (used when `LLM_URL` is not set):
+
+| Provider | Default base URL |
+|---|---|
+| `local` | `http://localhost:8000/v1` |
+| `openai` | `https://api.openai.com/v1` |
+| `anthropic` | `https://api.anthropic.com` |
+| `openrouter` | `https://openrouter.ai/api/v1` |
+| `ollama` | `http://localhost:11434/v1` |
+
+### Usage examples
 
 ```bash
+# local llama-server (default)
 python test_tool_loop.py "play born to be wild steppenwolf"
+
+# OpenAI
+LLM_PROVIDER=openai LLM_API_KEY=sk-... LLM_MODEL=gpt-4o \
+  python test_tool_loop.py "play born to be wild"
+
+# Anthropic Claude
+LLM_PROVIDER=anthropic LLM_API_KEY=sk-ant-... LLM_MODEL=claude-opus-4-5 \
+  python test_tool_loop.py "play born to be wild"
+
+# OpenRouter (access to many models via one key)
+LLM_PROVIDER=openrouter LLM_API_KEY=sk-or-... LLM_MODEL=openai/gpt-4o \
+  python test_tool_loop.py "play born to be wild"
+
+# Ollama (local, no key required)
+LLM_PROVIDER=ollama LLM_MODEL=qwen2.5:32b \
+  python test_tool_loop.py "play born to be wild"
+
+# Any OpenAI-compatible endpoint
+LLM_PROVIDER=custom LLM_URL=https://my-gateway.example.com/v1 LLM_API_KEY=... \
+  LLM_MODEL=my-model python test_tool_loop.py "play born to be wild"
 ```
 
-Requires `llama-server` running on `localhost:8000` and the MCP server on `localhost:8001`.
+Or configure via `.env`:
+
+```bash
+cp .env.example .env
+# set LLM_PROVIDER, LLM_API_KEY, LLM_MODEL in .env
+export $(grep -v '^#' .env | xargs)
+python test_tool_loop.py "play born to be wild"
+```
+
+### How it works
+
+1. Fetches tool schemas from mcpo (`/openapi.json`) and converts them to OpenAI tool-calling format.
+2. Sends user query to the LLM with the tools.
+3. Executes tool calls returned by the LLM against mcpo.
+4. Feeds results back to the LLM until it produces a final text response.
+
+For the **Anthropic** provider the script transparently converts between OpenAI-style tool calls and Anthropic's native `tool_use` / `tool_result` format — no extra dependencies needed beyond `requests`.
 
 ## License
 
