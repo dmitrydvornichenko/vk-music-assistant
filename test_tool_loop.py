@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Manual tool-calling loop test.
-Bypasses OpenWebUI completely — talks directly to llama-server + mcpo.
+Talks directly to llama-server + mcpo.
 """
 
 import json
@@ -167,5 +167,5 @@ def run(user_query: str):
 
 
 if __name__ == "__main__":
-    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "включи born to be wild steppenwolf"
+    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "play born to be wild steppenwolf"
     run(query)

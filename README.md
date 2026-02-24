@@ -98,10 +98,10 @@ See [`.env.example`](.env.example) for all options.
 
 ## Test script
 
-`test_tool_loop.py` — manual tool-calling loop that talks directly to a local llama-server + mcpo without Open WebUI:
+`test_tool_loop.py` — manual tool-calling loop that talks directly to a local llama-server + mcpo:
 
 ```bash
-python test_tool_loop.py "включи born to be wild steppenwolf"
+python test_tool_loop.py "play born to be wild steppenwolf"
 ```
 
 Requires `llama-server` running on `localhost:8000` and the MCP server on `localhost:8001`.
