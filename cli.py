@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Manual tool-calling loop test.
+VK Music Assistant — CLI client with LLM tool-calling loop.
 
-Supports local llama-server and cloud LLMs via environment variables:
+Supported LLM providers (set via environment variables):
 
   LLM_PROVIDER  local | openai | anthropic | openrouter | ollama | custom
                 default: local
@@ -11,21 +11,19 @@ Supports local llama-server and cloud LLMs via environment variables:
   LLM_MODEL     Model name
   MCPO_URL      mcpo endpoint (default: http://localhost:8001)
 
-Examples:
-  # local llama-server (default)
-  python test_tool_loop.py "play born to be wild"
+Usage:
+  # Pass query as argument
+  python cli.py "play born to be wild"
+  python cli.py "включи мою музыку вперемешку"
 
-  # OpenAI
-  LLM_PROVIDER=openai LLM_API_KEY=sk-... LLM_MODEL=gpt-4o python test_tool_loop.py "play born to be wild"
+  # Interactive input (supports special characters without quoting)
+  python cli.py
 
-  # Anthropic Claude
-  LLM_PROVIDER=anthropic LLM_API_KEY=sk-ant-... LLM_MODEL=claude-opus-4-5 python test_tool_loop.py "play born to be wild"
-
-  # OpenRouter
-  LLM_PROVIDER=openrouter LLM_API_KEY=sk-or-... LLM_MODEL=openai/gpt-4o python test_tool_loop.py "play born to be wild"
-
-  # Ollama (local, no key)
-  LLM_PROVIDER=ollama LLM_MODEL=qwen2.5:32b python test_tool_loop.py "play born to be wild"
+  # With a specific provider
+  LLM_PROVIDER=openai LLM_API_KEY=sk-... LLM_MODEL=gpt-4o python cli.py "play born to be wild"
+  LLM_PROVIDER=anthropic LLM_API_KEY=sk-ant-... LLM_MODEL=claude-opus-4-5 python cli.py "play born to be wild"
+  LLM_PROVIDER=openrouter LLM_API_KEY=sk-or-... LLM_MODEL=openai/gpt-4o python cli.py "play born to be wild"
+  LLM_PROVIDER=ollama LLM_MODEL=qwen2.5:32b python cli.py "play born to be wild"
 """
 
 import json
@@ -49,19 +47,54 @@ _DEFAULT_BASES: dict = {
 }
 
 SYSTEM_PROMPT = """\
-When the user asks to play music — do NOT ask for confirmation and do NOT show \
-intermediate results. Always do the following in one go:
-1. Call search_tracks first.
-2. Immediately call play_music with the best matching result.
-3. Only then tell the user what you started playing.
+You are a music assistant. Use tools to handle all music-related requests. \
+Do NOT ask for confirmation, do NOT show intermediate results — just call the right tool.
 
-Always pass access_key to play_music if search_tracks returned it.
-Pick the track that best matches: correct artist + correct album (if specified). \
-Prefer tracks where main_artists is present and matches the requested artist.
+## Playing a specific song or track
 
-CRITICAL: search_tracks does NOT play music. Music is NOT playing until you \
-explicitly call play_music. Calling search_tracks without calling play_music \
-afterwards = FAILURE."""
+SONG/TRACK request (песню, трек, song) → search_tracks(query), \
+then play_music with the single best matching result.
+Always pass access_key to play_music when search returned it.
+Prefer results where main_artists matches the requested artist.
+CRITICAL: search_tracks does NOT play music — you MUST call play_music afterwards.
+
+## Playing an album
+
+ALBUM request (альбом, album) → search_album(artist + album name).
+From the first matching result extract owner_id, album_id and access_key, \
+then call play_album(owner_id, album_id, access_key).
+Do NOT pass individual tracks to play_music for albums — use play_album instead.
+Add shuffle=True if the user wants shuffled playback.
+
+## Playing a user's music library
+
+- Own music (включи мою музыку, play my music) → play_user_audio()
+- Own music shuffled (вперемешку, shuffle) → play_user_audio(shuffle=True)
+- Another user's music (включи музыку Ивана Иванова) → find_user("First Last") → \
+play_user_audio(owner_id=<id from result>)
+- Another user's music shuffled → find_user(...) → \
+play_user_audio(owner_id=<id>, shuffle=True)
+
+## Playback control
+
+- Pause (пауза, pause) → pause_music()
+- Resume (продолжи, включи обратно, resume) → resume_music()
+- Stop and clear queue (стоп, stop) → stop_music()
+- Volume up (громче, louder) → volume_up()
+- Volume down (тише, quieter) → volume_down()
+
+## Queue management
+
+- Show queue (очередь, что играет, what's playing) → get_queue()
+- Skip current / next track (следующий, пропусти, skip) → skip_tracks(count=1)
+- Skip N tracks (пропусти N треков, skip N) → skip_tracks(count=N)
+- Skip to a specific track by name: get_queue() first to find its position (1-based \
+from the queue list), then skip_tracks(count=<that position>).
+
+## Account info
+
+- Who am I / чей токен / whose token → whoami()
+- Find user by name → find_user("Name Surname")"""
 
 
 # ---------------------------------------------------------------------------
@@ -369,5 +402,11 @@ def run(user_query: str):
 
 
 if __name__ == "__main__":
-    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "play born to be wild steppenwolf"
+    if len(sys.argv) > 1:
+        query = " ".join(sys.argv[1:])
+    else:
+        try:
+            query = input("User: ").strip()
+        except EOFError:
+            query = "play born to be wild steppenwolf"
     run(query)

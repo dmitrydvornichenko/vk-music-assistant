@@ -48,6 +48,15 @@ playback_lock = threading.Lock()
 playback_thread: threading.Thread | None = None
 playback_running = False
 
+# Playback position tracking (updated by worker thread)
+current_track_info: dict | None = None
+current_chunks: list = []
+current_chunk_idx: int = 0
+
+# Pause / resume state
+pause_state: dict | None = None
+playback_paused: bool = False
+
 
 if not VK_TOKEN:
     log.error("VK_TOKEN not set! Music service won't work.")
@@ -198,6 +207,27 @@ def _vk_call(method: str, params: dict) -> dict:
     return data.get("response", {})
 
 
+_cached_vk_user: dict | None = None
+
+
+def _fetch_vk_user() -> dict | None:
+    """Fetch and cache VK user info for the current token. Returns user dict or None."""
+    global _cached_vk_user
+    if _cached_vk_user is not None:
+        return _cached_vk_user
+    if not VK_TOKEN:
+        return None
+    try:
+        resp = _vk_call("users.get", {"fields": "photo_50"})
+        users = resp if isinstance(resp, list) else []
+        if users:
+            _cached_vk_user = users[0]
+            return _cached_vk_user
+    except Exception as e:
+        log.warning("Failed to fetch VK user info: %s", e)
+    return None
+
+
 def _validate_track_item(item: dict) -> bool:
     """Validate that VK track item has a reachable URL. Returns True if playable."""
     import requests
@@ -239,24 +269,35 @@ def _enqueue_tracks(track_objs: list, play_now: bool = False):
 
 def _playback_loop():
     """Worker loop: consume queue and play each track sequentially."""
-    global playback_running
+    global playback_running, current_track_info, current_chunks, current_chunk_idx
     try:
         while True:
             with playback_lock:
+                if playback_paused:
+                    playback_running = False
+                    return
                 if not playback_queue:
                     playback_running = False
                     return
                 track = playback_queue.pop(0)
 
-            try:
-                chunks = _get_track_chunks(track)
-            except Exception as e:
-                log.warning("Failed to get chunks for queued track: %s", e)
-                continue
+            # Use pre-loaded chunks for resumed tracks, otherwise fetch from URL
+            if "_resume_chunks" in track:
+                chunks = track["_resume_chunks"]
+            else:
+                try:
+                    chunks = _get_track_chunks(track)
+                except Exception as e:
+                    log.warning("Failed to get chunks for queued track: %s", e)
+                    continue
 
             if not chunks:
                 log.warning("No segments for queued track, skipping")
                 continue
+
+            current_track_info = {k: v for k, v in track.items() if k not in ("url", "_resume_chunks")}
+            current_chunks = chunks
+            current_chunk_idx = 0
 
             try:
                 if MODE == "file":
@@ -268,6 +309,9 @@ def _playback_loop():
                 continue
     finally:
         playback_running = False
+        current_track_info = None
+        current_chunks = []
+        current_chunk_idx = 0
 
 
 def _file_music_thread(chunks: list):
@@ -326,6 +370,7 @@ def _file_music_thread(chunks: list):
 
 
 def _stream_music_thread(chunks: list):
+    global current_chunk_idx
     ffmpeg_proc = None
     paplay_proc = None
     try:
@@ -354,6 +399,8 @@ def _stream_music_thread(chunks: list):
             active_music_processes[:] = [ffmpeg_proc, paplay_proc]
 
         for i, chunk in enumerate(chunks):
+            current_chunk_idx = i
+
             if ffmpeg_proc.poll() is not None:
                 raise RuntimeError(
                     f"ffmpeg died at segment {i+1} with code {ffmpeg_proc.returncode}"
@@ -459,8 +506,8 @@ def search_tracks(query: str) -> dict:
 @mcp.tool()
 def play_music(tracks: list) -> dict:
     """
-    Play one or several music tracks (songs or albums). If user asks to play a track or tracks or album,
-    you should search for the track or album, retrieve owner_id, track_id (and access_key if available)
+    Play one or several music tracks (songs). If user asks to play tracks,
+    you should search for the track, retrieve owner_id, track_id (and access_key if available)
     and pass them to play_music. Always pass access_key when search_tracks returned it.
 
     Args:
@@ -549,6 +596,7 @@ def search_album(query: str) -> dict:
                 "album_title": title,
                 "owner_id": owner,
                 "album_id": album_id,
+                "access_key": album.get("access_key", ""),
                 "tracks": [
                     {
                         "artist": t.get("artist"),
@@ -569,11 +617,18 @@ def search_album(query: str) -> dict:
 
 @mcp.tool()
 def stop_music() -> dict:
-    """Stop all currently playing music.
+    """Stop all currently playing music and clear the playback queue.
 
     Returns:
         Dict with status and the number of processes that were stopped.
     """
+    global pause_state, playback_paused
+
+    with playback_lock:
+        playback_queue.clear()
+        playback_paused = False
+    pause_state = None
+
     with active_music_lock:
         procs = list(active_music_processes)
         active_music_processes.clear()
@@ -586,7 +641,7 @@ def stop_music() -> dict:
         except Exception:
             pass
 
-    log.info("Stopped %d music processes", stopped)
+    log.info("Stopped %d music processes, queue cleared", stopped)
     return {"status": "stopped", "count": stopped}
 
 
@@ -605,6 +660,392 @@ def music_health() -> dict:
     if MODE == "file":
         result["temp_dir"] = TEMP_DIR
     return result
+
+
+@mcp.tool()
+def pause_music() -> dict:
+    """Pause the currently playing music. Saves position so playback can be resumed."""
+    global pause_state, playback_paused
+
+    with playback_lock:
+        if playback_paused:
+            return {"status": "already_paused"}
+        # Snapshot current state before setting the flag
+        snap_track = current_track_info
+        snap_chunks = list(current_chunks)
+        snap_idx = current_chunk_idx
+        playback_paused = True
+
+    if not snap_track and not snap_chunks:
+        with playback_lock:
+            playback_paused = False
+        return {"error": "Nothing is playing"}
+
+    pause_state = {
+        "track": snap_track,
+        "chunks": snap_chunks,
+        "chunk_index": snap_idx,
+    }
+
+    with active_music_lock:
+        procs = list(active_music_processes)
+    for proc in procs:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    info = f"{snap_track.get('artist')} — {snap_track.get('title')}" if snap_track else "unknown"
+    log.info("Music paused at chunk %d: %s", snap_idx, info)
+    return {"status": "paused", "track": snap_track, "chunk_index": snap_idx}
+
+
+@mcp.tool()
+def resume_music() -> dict:
+    """Resume playback from the point where it was paused."""
+    global pause_state, playback_paused
+
+    if not pause_state:
+        return {"error": "No paused track to resume"}
+
+    saved = pause_state
+    pause_state = None
+
+    with playback_lock:
+        playback_paused = False
+
+    chunks = saved.get("chunks", [])
+    idx = saved.get("chunk_index", 0)
+    remaining = chunks[idx:]
+
+    if not remaining:
+        return {"error": "No remaining audio data to resume"}
+
+    track = dict(saved.get("track") or {})
+    track["_resume_chunks"] = remaining
+    if "url" not in track:
+        track["url"] = ""
+
+    _enqueue_tracks([track], play_now=True)
+
+    info = f"{track.get('artist')} — {track.get('title')}"
+    log.info("Resuming music from chunk %d: %s", idx, info)
+    return {
+        "status": "resumed",
+        "track": {"artist": track.get("artist"), "title": track.get("title")},
+        "from_chunk": idx,
+    }
+
+
+@mcp.tool()
+def volume_up() -> dict:
+    """Increase the system audio volume by 10%."""
+    env = os.environ.copy()
+    if PULSE_SERVER:
+        env["PULSE_SERVER"] = PULSE_SERVER
+    try:
+        result = subprocess.run(
+            ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+10%"],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return {"error": result.stderr.strip() or "pactl failed"}
+        log.info("Volume increased by 10%%")
+        return {"status": "ok", "action": "volume_up"}
+    except Exception as e:
+        log.exception("volume_up error: %s", e)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def volume_down() -> dict:
+    """Decrease the system audio volume by 10%."""
+    env = os.environ.copy()
+    if PULSE_SERVER:
+        env["PULSE_SERVER"] = PULSE_SERVER
+    try:
+        result = subprocess.run(
+            ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-10%"],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return {"error": result.stderr.strip() or "pactl failed"}
+        log.info("Volume decreased by 10%%")
+        return {"status": "ok", "action": "volume_down"}
+    except Exception as e:
+        log.exception("volume_down error: %s", e)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_queue() -> dict:
+    """Return the current playback queue and the currently playing track."""
+    with playback_lock:
+        queue_copy = list(playback_queue)
+
+    tracks = [
+        {
+            "artist": t.get("artist"),
+            "title": t.get("title"),
+            "duration": t.get("duration"),
+        }
+        for t in queue_copy
+        if "_resume_chunks" not in t
+    ]
+
+    result: dict = {
+        "status": "ok",
+        "currently_playing": current_track_info,
+        "paused": playback_paused,
+        "queue_count": len(tracks),
+        "queue": tracks,
+    }
+    if pause_state:
+        result["paused_track"] = pause_state.get("track")
+    return result
+
+
+@mcp.tool()
+def skip_tracks(count: int = 1) -> dict:
+    """Skip one or more tracks.
+
+    Use for prompts like:
+      'next track' / 'skip' → count=1
+      'skip two songs' → count=2
+      'skip three tracks' → count=3  (and so on)
+
+    Skips the currently playing track plus the next (count-1) queued tracks.
+
+    Args:
+        count: Total number of tracks to skip (including the current one). Default is 1.
+    """
+    if count < 1:
+        return {"error": "count must be at least 1"}
+
+    with playback_lock:
+        to_remove = min(count - 1, len(playback_queue))
+        for _ in range(to_remove):
+            playback_queue.pop(0)
+
+    with active_music_lock:
+        procs = list(active_music_processes)
+    for proc in procs:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    log.info("Skipping %d track(s)", count)
+    return {"status": "skipped", "count": count}
+
+
+@mcp.tool()
+def whoami() -> dict:
+    """Return information about the VK account whose token is currently in use.
+
+    Returns:
+        Dict with id, first_name, last_name, and profile photo URL.
+    """
+    if not VK_TOKEN:
+        return {"error": "VK_TOKEN is not set"}
+    user = _fetch_vk_user()
+    if not user:
+        return {"error": "Failed to retrieve user info from VK"}
+    return {
+        "status": "ok",
+        "id": user.get("id"),
+        "first_name": user.get("first_name"),
+        "last_name": user.get("last_name"),
+        "photo": user.get("photo_50"),
+    }
+
+
+@mcp.tool()
+def find_user(query: str = "") -> dict:
+    """Find a VK user by name/surname and return their ID and basic info.
+
+    Friends of the token owner appear first in results, followed by global search results.
+    If query is empty, returns info about the account whose token is in use.
+
+    Args:
+        query: Name or surname to search (e.g. "Ivan Petrov"). Leave empty to get own info.
+    """
+    q = (query or "").strip()
+    if not q:
+        user = _fetch_vk_user()
+        if not user:
+            return {"error": "VK_TOKEN not set or failed to fetch own user info"}
+        return {
+            "status": "ok",
+            "users": [{
+                "id": user.get("id"),
+                "first_name": user.get("first_name"),
+                "last_name": user.get("last_name"),
+            }],
+        }
+
+    def _fmt(u: dict) -> dict:
+        return {
+            "id": u.get("id"),
+            "first_name": u.get("first_name"),
+            "last_name": u.get("last_name"),
+        }
+
+    try:
+        results: list[dict] = []
+        seen_ids: set = set()
+
+        # Friends first
+        try:
+            fr_resp = _vk_call("friends.search", {"q": q, "count": 10, "fields": ""})
+            for u in fr_resp.get("items", []):
+                uid = u.get("id")
+                if uid and uid not in seen_ids:
+                    seen_ids.add(uid)
+                    results.append({**_fmt(u), "is_friend": True})
+        except Exception as e:
+            log.debug("friends.search failed (non-critical): %s", e)
+
+        # Global search — append only those not already in friends results
+        gl_resp = _vk_call("users.search", {"q": q, "count": 10})
+        for u in gl_resp.get("items", []):
+            uid = u.get("id")
+            if uid and uid not in seen_ids:
+                seen_ids.add(uid)
+                results.append({**_fmt(u), "is_friend": False})
+
+        return {"status": "ok", "users": results}
+    except Exception as e:
+        log.exception("find_user error: %s", e)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def play_user_audio(owner_id: int = 0, shuffle: bool = False, count: int = 1000) -> dict:
+    """Fetch and queue audio tracks from a VK user's profile.
+
+    Tracks are fetched and queued directly — the model never sees individual track data,
+    making this safe even for very large libraries.
+
+    VK API has no server-side shuffle; when shuffle=True the order is randomised locally
+    before queuing.
+
+    Args:
+        owner_id: VK user ID whose audio to play. Pass 0 (default) to play own music.
+        shuffle: Randomise track order before queuing (default False).
+        count: Maximum number of tracks to fetch (default 1000).
+    """
+    if not VK_TOKEN:
+        return {"error": "VK_TOKEN is not set"}
+
+    params: dict = {"count": count, "extended": 0}
+    display_owner = owner_id
+
+    if owner_id:
+        params["owner_id"] = owner_id
+    else:
+        user = _fetch_vk_user()
+        if user:
+            display_owner = user.get("id", 0)
+
+    try:
+        resp = _vk_call("audio.get", params)
+        items = resp.get("items", [])
+
+        track_objs = [
+            {
+                "url": item.get("url"),
+                "artist": item.get("artist"),
+                "title": item.get("title"),
+                "duration": item.get("duration"),
+            }
+            for item in items
+            if item.get("url")
+        ]
+
+        if not track_objs:
+            return {"error": "No playable tracks found for this user"}
+
+        if shuffle:
+            import random
+            random.shuffle(track_objs)
+
+        _enqueue_tracks(track_objs)
+
+        log.info("Queued %d tracks for user %s (shuffle=%s)", len(track_objs), display_owner, shuffle)
+        return {
+            "status": "queued",
+            "owner_id": display_owner,
+            "count": len(track_objs),
+            "shuffled": shuffle,
+        }
+    except Exception as e:
+        log.exception("play_user_audio error: %s", e)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def play_album(owner_id: int, album_id: int, access_key: str = "", shuffle: bool = False) -> dict:
+    """Fetch and queue all tracks from a VK album or playlist.
+
+    Tracks are fetched and queued directly — safe for large albums.
+    Use search_album first to obtain owner_id, album_id and access_key.
+
+    VK API has no server-side shuffle; when shuffle=True the order is randomised locally.
+
+    Args:
+        owner_id: Album owner's VK user or community ID.
+        album_id: Album (playlist) ID.
+        access_key: Album access key returned by search_album (required for many albums).
+        shuffle: Randomise track order before queuing (default False).
+    """
+    try:
+        params: dict = {
+            "owner_id": owner_id,
+            "album_id": album_id,
+            "count": 1000,
+            "extended": 0,
+        }
+        if access_key:
+            params["access_key"] = access_key
+
+        resp = _vk_call("audio.get", params)
+        items = resp.get("items", [])
+
+        track_objs = [
+            {
+                "url": item.get("url"),
+                "artist": item.get("artist"),
+                "title": item.get("title"),
+                "duration": item.get("duration"),
+            }
+            for item in items
+            if item.get("url")
+        ]
+
+        if not track_objs:
+            return {"error": "No playable tracks found in this album"}
+
+        if shuffle:
+            import random
+            random.shuffle(track_objs)
+
+        _enqueue_tracks(track_objs)
+
+        log.info(
+            "Queued %d tracks from album %s/%s (shuffle=%s)",
+            len(track_objs), owner_id, album_id, shuffle,
+        )
+        return {
+            "status": "queued",
+            "owner_id": owner_id,
+            "album_id": album_id,
+            "count": len(track_objs),
+            "shuffled": shuffle,
+        }
+    except Exception as e:
+        log.exception("play_album error: %s", e)
+        return {"error": str(e)}
 
 
 if __name__ == "__main__":

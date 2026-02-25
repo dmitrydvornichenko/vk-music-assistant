@@ -9,8 +9,18 @@ Exposes tools over HTTP via [mcpo](https://github.com/open-webui/mcpo).
 |---|---|
 | `search_tracks` | Search VK Audio by artist / title |
 | `search_album` | Search albums and list their tracks |
-| `play_music` | Queue and play one or several tracks |
-| `stop_music` | Stop playback immediately |
+| `play_music` | Queue and play one or several tracks by ID |
+| `play_album` | Queue all tracks from an album/playlist by ID (safe for large albums) |
+| `play_user_audio` | Queue a user's full audio library (own or by ID), with optional shuffle |
+| `find_user` | Find VK user by name — friends first, then global search |
+| `whoami` | Return info about the account whose token is in use |
+| `pause_music` | Pause playback, saving current position |
+| `resume_music` | Resume from where playback was paused |
+| `stop_music` | Stop playback and clear the queue |
+| `skip_tracks` | Skip one or more tracks in the queue |
+| `get_queue` | Show currently playing track and upcoming queue |
+| `volume_up` | Increase system volume by 10% |
+| `volume_down` | Decrease system volume by 10% |
 | `music_health` | Health check: token status, current mode |
 
 ## Quick start
@@ -107,7 +117,7 @@ See [`.env.example`](.env.example) for all options.
 
 ## Test script
 
-`test_tool_loop.py` — manual tool-calling loop that talks to an LLM + mcpo.  
+`cli.py` — CLI client with LLM tool-calling loop that talks to an LLM + mcpo.  
 Supports **local llama-server** and any major cloud provider.
 
 ### LLM environment variables
@@ -134,27 +144,27 @@ Default base URLs (used when `LLM_URL` is not set):
 
 ```bash
 # local llama-server (default)
-python test_tool_loop.py "play born to be wild steppenwolf"
+python cli.py "play born to be wild steppenwolf"
 
 # OpenAI
 LLM_PROVIDER=openai LLM_API_KEY=sk-... LLM_MODEL=gpt-4o \
-  python test_tool_loop.py "play born to be wild"
+  python cli.py "play born to be wild"
 
 # Anthropic Claude
 LLM_PROVIDER=anthropic LLM_API_KEY=sk-ant-... LLM_MODEL=claude-opus-4-5 \
-  python test_tool_loop.py "play born to be wild"
+  python cli.py "play born to be wild"
 
 # OpenRouter (access to many models via one key)
 LLM_PROVIDER=openrouter LLM_API_KEY=sk-or-... LLM_MODEL=openai/gpt-4o \
-  python test_tool_loop.py "play born to be wild"
+  python cli.py "play born to be wild"
 
 # Ollama (local, no key required)
 LLM_PROVIDER=ollama LLM_MODEL=qwen2.5:32b \
-  python test_tool_loop.py "play born to be wild"
+  python cli.py "play born to be wild"
 
 # Any OpenAI-compatible endpoint
 LLM_PROVIDER=custom LLM_URL=https://my-gateway.example.com/v1 LLM_API_KEY=... \
-  LLM_MODEL=my-model python test_tool_loop.py "play born to be wild"
+  LLM_MODEL=my-model python cli.py "play born to be wild"
 ```
 
 Or configure via `.env`:
@@ -163,7 +173,7 @@ Or configure via `.env`:
 cp .env.example .env
 # set LLM_PROVIDER, LLM_API_KEY, LLM_MODEL in .env
 export $(grep -v '^#' .env | xargs)
-python test_tool_loop.py "play born to be wild"
+python cli.py "play born to be wild"
 ```
 
 ### How it works
