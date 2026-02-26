@@ -95,6 +95,40 @@ docker compose up --build -d
 
 ---
 
+### Auth server (token management)
+
+`auth_server.py` runs as a **separate container** (`auth`, port `8080`).  
+It handles VK login and keeps the token fresh automatically — no manual token copying needed.
+
+**How it works:**
+
+1. Open `http://your-host:8080/auth` in a browser.
+2. A headless Chromium streams the VK login page to your browser via WebSocket (remote desktop for a single tab). Log in once — handles password, 2FA, CAPTCHA.
+3. After login the browser session state (cookies) is saved to `playwright_state.json`.
+4. A background task silently navigates through VK OAuth every 6 hours, captures the new `access_token`, and writes it to `.vk_token`.
+5. `music-mcp` hot-reloads the token from `.vk_token` on every API call — no restart needed.
+
+Both containers share a named Docker volume (`vk_data`) for `.vk_token` and `playwright_state.json`.
+
+**Endpoints:**
+
+| Endpoint | Description |
+|---|---|
+| `GET /auth` | Remote-browser login UI |
+| `GET /status` | JSON: token present, session saved, next refresh in N seconds |
+
+**Auth server environment variables:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `AUTH_PORT` | `8080` | HTTP port |
+| `TOKEN_FILE` | `.vk_token` | Where to write the refreshed token |
+| `STATE_FILE` | `playwright_state.json` | Playwright browser session state |
+| `ENV_FILE` | `.env` | `.env` file to patch `VK_TOKEN` in (set to `""` in Docker) |
+| `TOKEN_REFRESH_INTERVAL` | `21600` | Refresh interval in seconds (default 6 h) |
+
+---
+
 ## Playback modes
 
 | `MODE` | Behaviour |

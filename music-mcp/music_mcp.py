@@ -12,6 +12,7 @@ import tempfile
 import logging
 import re
 import threading
+import time
 import sys
 
 from mcp.server.fastmcp import FastMCP
@@ -30,6 +31,41 @@ if log_level != "DEBUG":
         logging.getLogger(_lib).setLevel(logging.WARNING)
 
 VK_TOKEN = os.environ.get("VK_TOKEN", "")
+
+# Hot-reload: track .vk_token file changes and update VK_TOKEN without restart
+_TOKEN_FILE = os.path.join(os.path.dirname(__file__) or ".", ".vk_token")
+_token_file_mtime: float = 0.0
+_token_lock_reload = threading.Lock()
+
+
+def _reload_token_if_changed():
+    """Check .vk_token mtime; if changed, reload VK_TOKEN from the file."""
+    global VK_TOKEN, _token_file_mtime, _cached_vk_user
+    try:
+        mtime = os.path.getmtime(_TOKEN_FILE)
+    except OSError:
+        return
+    if mtime <= _token_file_mtime:
+        return
+    with _token_lock_reload:
+        # Re-check inside lock (another thread might have already reloaded)
+        try:
+            mtime = os.path.getmtime(_TOKEN_FILE)
+        except OSError:
+            return
+        if mtime <= _token_file_mtime:
+            return
+        try:
+            import json as _json
+            data = _json.loads(open(_TOKEN_FILE).read())
+            new_token = data.get("access_token", "")
+            if new_token and new_token != VK_TOKEN:
+                VK_TOKEN = new_token
+                _cached_vk_user = None  # invalidate user info cache
+                log.info("VK_TOKEN hot-reloaded from %s", _TOKEN_FILE)
+            _token_file_mtime = mtime
+        except Exception as e:
+            log.warning("Failed to reload token from %s: %s", _TOKEN_FILE, e)
 _pulse_default = "unix:{}/pulse/native".format(
     os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
 )
@@ -50,6 +86,7 @@ playback_running = False
 
 # Playback position tracking (updated by worker thread)
 current_track_info: dict | None = None
+current_track_url: str = ""   # HLS manifest URL — saved separately for resume re-fetch
 current_chunks: list = []
 current_chunk_idx: int = 0
 
@@ -72,7 +109,58 @@ def _sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "_", name)
 
 
+def _wait_or_kill(proc: subprocess.Popen, timeout: float, label: str):
+    """Wait for a process to finish; kill it if it doesn't within timeout seconds."""
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log.warning("%s did not finish in %.0fs, killing", label, timeout)
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
 def _get_track_chunks(track):
+    """Parse a VK HLS playlist and return a list of segment descriptors.
+
+    How it works
+    ------------
+    VK serves audio as an HLS (HTTP Live Streaming) playlist — a plain-text .m3u8
+    file that describes a list of short MPEG-TS segments (.ts files), each typically
+    4-10 seconds long.  The segments may be AES-128 encrypted; each encrypted group
+    shares a key URL that is fetched once and reused.
+
+    Step 1 — fetch the playlist text from track["url"].
+
+    Step 2 — split into key-sections.  Each section begins with an
+      #EXT-X-KEY:METHOD=...,URI=...
+    line and contains all segments encrypted with that key.  We iterate over sections
+    using a regex that captures everything up to the next #EXT-X-KEY tag.
+
+    Step 3 — inside each section find every .ts segment line and build a chunk dict:
+      {
+        "file_url":   full URL of the .ts segment (base dir + filename + query tail),
+        "key_method": encryption method ("AES-128" or "NONE"),
+        "key_url":    URL of the AES key (None for unencrypted),
+        "file":       bare filename (used for deduplication / logging),
+        "extinf":     segment duration in seconds from #EXTINF tag (float),
+      }
+
+    Step 4 — for each unique key URL, download the raw AES-128 key bytes once and
+    cache them; store the bytes in chunk["key"] so _decrypt_chunk can use them
+    without a redundant network request.
+
+    Step 5 — extract #EXTINF:<seconds>, tags from the playlist in order.  These are
+    guaranteed to appear in the same order as the segment lines, so extinf_values[i]
+    corresponds directly to chunks[i].  The extinf value enables precise remaining-
+    duration calculation for pause/resume and for the process-kill timeout.
+
+    Returns
+    -------
+    list of chunk dicts ready to be passed to _decrypt_chunk() one by one.
+    """
     import requests as req
     # accept either object with .url or dict with 'url'
     url = getattr(track, "url", None) or (track.get("url") if isinstance(track, dict) else None)
@@ -104,7 +192,14 @@ def _get_track_chunks(track):
             file = match2.group("file")
             extra = match2.group("extra")
             file_url = f"{urldir}/{file}{extra}"
-            chunks.append({"file_url": file_url, "key_method": key_method, "key_url": key_url, "file": file})
+            chunks.append({"file_url": file_url, "key_method": key_method, "key_url": key_url,
+                           "file": file, "extinf": 0.0})
+
+    # Step 5: assign #EXTINF durations in order — same index as segments in playlist
+    extinf_values = [float(m.group(1)) for m in re.finditer(r'#EXTINF:([\d.]+)', playlist)]
+    for i, chunk in enumerate(chunks):
+        if i < len(extinf_values):
+            chunk["extinf"] = extinf_values[i]
 
     cached_keys: dict = {}
     for chunk in chunks:
@@ -117,24 +212,40 @@ def _get_track_chunks(track):
             cached_keys[key_url] = req.get(key_url).content
         chunk["key"] = cached_keys[key_url]
 
-    log.debug("Found %d segments", len(chunks))
+    total_dur = sum(c["extinf"] for c in chunks)
+    log.debug("Found %d segments, total duration %.1fs", len(chunks), total_dur)
     return chunks
 
 
-def _decrypt_chunk(chunk) -> bytes:
-    if chunk["key"]:
-        from urllib.request import urlopen
-        from Crypto.Cipher import AES
-        from Crypto.Util.Padding import unpad
-        key = chunk["key"]
-        file_in = urlopen(chunk["file_url"])
-        iv = file_in.read(16)
-        ciphered_data = file_in.read()
-        file_in.close()
-        cipher = AES.new(key, AES.MODE_CBC, iv=iv)
-        return unpad(cipher.decrypt(ciphered_data), AES.block_size)
-    import requests as req
-    return req.get(chunk["file_url"]).content
+def _decrypt_chunk(chunk, retries: int = 4, backoff: float = 1.5) -> bytes:
+    from urllib.error import URLError
+    url = chunk["file_url"]
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        if attempt:
+            delay = backoff * attempt
+            log.warning("Retry %d/%d for segment %s (delay %.1fs)", attempt, retries - 1, url, delay)
+            time.sleep(delay)
+        try:
+            if chunk["key"]:
+                from urllib.request import urlopen
+                from Crypto.Cipher import AES
+                from Crypto.Util.Padding import unpad
+                key = chunk["key"]
+                file_in = urlopen(url, timeout=15)
+                iv = file_in.read(16)
+                ciphered_data = file_in.read()
+                file_in.close()
+                cipher = AES.new(key, AES.MODE_CBC, iv=iv)
+                return unpad(cipher.decrypt(ciphered_data), AES.block_size)
+            import requests as req
+            resp = req.get(url, timeout=15)
+            resp.raise_for_status()
+            return resp.content
+        except Exception as e:
+            last_exc = e
+            log.warning("Segment fetch error (attempt %d/%d): %s", attempt + 1, retries, e)
+    raise last_exc
 
 
 def _download_and_save_mp3(output_path: str, chunks: list):
@@ -186,8 +297,9 @@ def _vk_call(method: str, params: dict) -> dict:
     """Call VK API method and return parsed JSON response (raises on error)."""
     import requests
 
+    _reload_token_if_changed()
+
     base = f"https://api.vk.com/method/{method}"
-    # Ensure token and version
     req_params = dict(params or {})
     if VK_TOKEN:
         req_params["access_token"] = VK_TOKEN
@@ -269,7 +381,7 @@ def _enqueue_tracks(track_objs: list, play_now: bool = False):
 
 def _playback_loop():
     """Worker loop: consume queue and play each track sequentially."""
-    global playback_running, current_track_info, current_chunks, current_chunk_idx
+    global playback_running, current_track_info, current_track_url, current_chunks, current_chunk_idx
     try:
         while True:
             with playback_lock:
@@ -295,26 +407,31 @@ def _playback_loop():
                 log.warning("No segments for queued track, skipping")
                 continue
 
-            current_track_info = {k: v for k, v in track.items() if k not in ("url", "_resume_chunks")}
+            current_track_url = track.get("url", "")
+            # _duration is pre-calculated remaining duration for resumed tracks
+            play_duration = float(track.get("_duration") or track.get("duration") or 0)
+            current_track_info = {k: v for k, v in track.items()
+                                  if k not in ("url", "_resume_chunks", "_duration")}
             current_chunks = chunks
             current_chunk_idx = 0
 
             try:
                 if MODE == "file":
-                    _file_music_thread(chunks)
+                    _file_music_thread(chunks, duration=play_duration)
                 else:
-                    _stream_music_thread(chunks)
+                    _stream_music_thread(chunks, duration=play_duration)
             except Exception as e:
                 log.exception("Error while playing queued track: %s", e)
                 continue
     finally:
         playback_running = False
         current_track_info = None
+        current_track_url = ""
         current_chunks = []
         current_chunk_idx = 0
 
 
-def _file_music_thread(chunks: list):
+def _file_music_thread(chunks: list, duration: float = 0.0):
     """Download chunks to a temp MP3 file, then play it via ffmpeg+paplay."""
     temp_path = None
     ffmpeg_dec = None
@@ -347,8 +464,9 @@ def _file_music_thread(chunks: list):
         with active_music_lock:
             active_music_processes[:] = [ffmpeg_dec, paplay_proc]
 
-        ffmpeg_dec.wait()
-        paplay_proc.wait()
+        play_timeout = max(10.0, duration + 1.0) if duration else 60.0
+        _wait_or_kill(ffmpeg_dec, timeout=play_timeout, label="ffmpeg (file)")
+        _wait_or_kill(paplay_proc, timeout=play_timeout, label="paplay (file)")
         log.info("File playback complete")
     except Exception as e:
         log.exception("File mode playback error: %s", e)
@@ -369,10 +487,11 @@ def _file_music_thread(chunks: list):
                 log.warning("Could not remove temp file %s: %s", temp_path, e)
 
 
-def _stream_music_thread(chunks: list):
+def _stream_music_thread(chunks: list, duration: float = 0.0):
     global current_chunk_idx
     ffmpeg_proc = None
     paplay_proc = None
+    stream_start = time.time()
     try:
         env = os.environ.copy()
         if PULSE_SERVER:
@@ -431,8 +550,13 @@ def _stream_music_thread(chunks: list):
 
         ffmpeg_proc.stdin.close()
         log.info("Music streaming completed, waiting for processes to finish...")
-        ffmpeg_proc.wait()
-        paplay_proc.wait()
+        elapsed = time.time() - stream_start
+        # Use sum of #EXTINF durations for accuracy; fall back to passed track duration
+        extinf_total = sum(c.get("extinf", 0.0) for c in chunks)
+        effective_duration = extinf_total if extinf_total > 0 else duration
+        remaining_s = max(5.0, effective_duration - elapsed + 1.0) if effective_duration else 30.0
+        _wait_or_kill(ffmpeg_proc, timeout=min(30.0, remaining_s + 5), label="ffmpeg (stream)")
+        _wait_or_kill(paplay_proc, timeout=remaining_s, label="paplay (stream)")
         log.info("Processes finished")
     except Exception as e:
         log.exception("Streaming error: %s", e)
@@ -682,9 +806,11 @@ def pause_music() -> dict:
         return {"error": "Nothing is playing"}
 
     pause_state = {
-        "track": snap_track,
-        "chunks": snap_chunks,
-        "chunk_index": snap_idx,
+        "track":        snap_track,
+        "chunks":       snap_chunks,
+        "chunk_index":  snap_idx,
+        "total_chunks": len(snap_chunks),
+        "url":          current_track_url,
     }
 
     with active_music_lock:
@@ -714,26 +840,44 @@ def resume_music() -> dict:
     with playback_lock:
         playback_paused = False
 
-    chunks = saved.get("chunks", [])
-    idx = saved.get("chunk_index", 0)
-    remaining = chunks[idx:]
+    idx           = saved.get("chunk_index", 0)
+    hls_url       = saved.get("url", "")
+    track_duration = float((saved.get("track") or {}).get("duration") or 0)
 
+    # Re-fetch chunks for fresh URLs; also needed for accurate remaining-duration calc
+    all_chunks = saved.get("chunks", [])
+    if hls_url:
+        try:
+            all_chunks = _get_track_chunks({"url": hls_url})
+            log.debug("Re-fetched %d chunks for resume", len(all_chunks))
+        except Exception as e:
+            log.warning("Failed to re-fetch chunks on resume, using cached: %s", e)
+
+    remaining = all_chunks[idx:]
     if not remaining:
         return {"error": "No remaining audio data to resume"}
 
+    # Exact remaining duration from #EXTINF tags; fall back to proportional estimate
+    remaining_duration = sum(c.get("extinf", 0.0) for c in remaining)
+    if not remaining_duration:
+        total = len(all_chunks)
+        remaining_duration = (track_duration * len(remaining) / total) if total else track_duration
+
     track = dict(saved.get("track") or {})
     track["_resume_chunks"] = remaining
-    if "url" not in track:
-        track["url"] = ""
+    track["_duration"]      = remaining_duration
+    track["url"]            = hls_url  # needed by _playback_loop for current_track_url
 
     _enqueue_tracks([track], play_now=True)
 
     info = f"{track.get('artist')} — {track.get('title')}"
-    log.info("Resuming music from chunk %d: %s", idx, info)
+    log.info("Resuming music from chunk %d/%d (%.0fs remaining): %s",
+             idx, len(all_chunks), remaining_duration, info)
     return {
-        "status": "resumed",
-        "track": {"artist": track.get("artist"), "title": track.get("title")},
-        "from_chunk": idx,
+        "status":        "resumed",
+        "track":         {"artist": track.get("artist"), "title": track.get("title")},
+        "from_chunk":    idx,
+        "remaining_sec": int(remaining_duration),
     }
 
 

@@ -1,16 +1,40 @@
 services:
+
+  # ── VK Music MCP server ───────────────────────────────────────────────────
   music-mcp:
     build:
-      context: .
-    container_name: music-mcp
-    ports:
-      - "8001:8001"
-    env_file: .env
-    volumes:
-      - music-tmp:/tmp/music-mcp
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      context: ./music-mcp
     restart: unless-stopped
+    env_file: .env
+    environment:
+      TOKEN_FILE: /data/.vk_token
+    volumes:
+      - vk_data:/data
+      # Mount host PulseAudio socket — adjust the host path to match your setup:
+      #   Linux default:  /run/user/1000/pulse/native
+      #   custom:         set PULSE_SOCKET_PATH in .env
+      - ${PULSE_SOCKET_PATH:-/run/user/1000/pulse/native}:/tmp/pulse-native:ro
+    ports:
+      - "${MCP_PORT:-8001}:8001"
 
+  # ── Auth server (remote-browser VK login + token auto-refresh) ────────────
+  auth:
+    build:
+      context: ./auth
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TOKEN_FILE:  /data/.vk_token
+      STATE_FILE:  /data/playwright_state.json
+      # Disable .env patching inside Docker — token is shared via TOKEN_FILE
+      ENV_FILE: ""
+      AUTH_PORT: "8080"
+    volumes:
+      - vk_data:/data
+    ports:
+      - "${AUTH_PORT:-8080}:8080"
+
+# Shared named volume: auth writes .vk_token + playwright_state.json here;
+# music-mcp reads .vk_token via hot-reload whenever it changes.
 volumes:
-  music-tmp:
+  vk_data:
