@@ -8,6 +8,8 @@ services:
     env_file: .env
     environment:
       TOKEN_FILE: /data/.vk_token
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - vk_data:/data
       # Mount host PulseAudio socket — adjust the host path to match your setup:

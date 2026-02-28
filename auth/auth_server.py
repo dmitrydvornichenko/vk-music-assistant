@@ -39,6 +39,7 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -80,6 +81,7 @@ _last_refresh_ts: float = 0.0  # epoch of last successful refresh
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _oauth_url() -> str:
+    """Build VK OAuth implicit-flow URL. Always uses revoke=1."""
     return (
         "https://oauth.vk.com/authorize"
         f"?client_id={VK_APP_ID}"
@@ -87,6 +89,7 @@ def _oauth_url() -> str:
         f"&redirect_uri={REDIRECT_URI}"
         f"&scope={SCOPES}"
         "&response_type=token"
+        "&revoke=1"
         "&v=5.131"
     )
 
@@ -125,20 +128,40 @@ def _patch_env(key: str, value: str) -> None:
     log.info("Patched %s in %s", key, ENV_FILE)
 
 
+# Keys that must go through keyboard.press() (named / non-printable)
+_NAMED_KEYS = {
+    "Enter", "Backspace", "Delete", "Tab", "Escape", "Space",
+    "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+    "Home", "End", "PageUp", "PageDown",
+    "Shift", "Control", "Alt", "Meta", "CapsLock",
+    "Insert", "NumLock", "ScrollLock", "Pause", "PrintScreen",
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+}
+
+
 async def _handle_input(page, data: dict) -> None:
     """Forward a single user-input event to the Playwright page."""
     t = data.get("type")
     try:
         if t == "click":
-            await page.mouse.click(data["x"], data["y"])
+            x, y = data["x"], data["y"]
+            # CDP mouse events are marked isTrusted=true — required for VK's React forms
+            await page.mouse.click(x, y)
+            log.debug("click at (%d,%d)", x, y)
         elif t == "dblclick":
             await page.mouse.dblclick(data["x"], data["y"])
-        elif t == "move":
-            await page.mouse.move(data["x"], data["y"])
+        # mouse_move intentionally omitted — it causes too many VK tracking requests
         elif t == "wheel":
             await page.mouse.wheel(data.get("dx", 0), data.get("dy", 0))
         elif t == "key":
-            await page.keyboard.press(data["key"])
+            key = data["key"]
+            if key in _NAMED_KEYS or len(key) > 1:
+                # Named / special key — press() handles keydown+keyup
+                await page.keyboard.press(key)
+            else:
+                # Printable character — type() fires the full keydown+keypress+input+keyup
+                # sequence that form validators (like VK login) expect
+                await page.keyboard.type(key)
         elif t == "type":
             await page.keyboard.type(data["text"])
     except Exception as e:
@@ -149,10 +172,17 @@ async def _handle_input(page, data: dict) -> None:
 
 async def _silent_refresh() -> tuple | None:
     """
-    Open a throwaway Chromium context with the saved session state, navigate to
-    the VK OAuth URL, and capture the new access_token from the redirect URL.
+    Open a throwaway Chromium context with the saved session state and refresh token.
 
-    Returns (token, expires_in) on success, or None if the session has expired.
+    Steps:
+      1. Navigate to vk.com and wait for redirect to default page (feed or other)
+      2. If redirected to login page ("Вконтакте Добро пожаловать"), log warning and abort
+      3. Navigate to OAuth URL (always with revoke=1)
+      4. Wait for "Continue as ..." button to appear (timeout 1 min)
+      5. Click button after random 1-2 second delay
+      6. Wait for redirect to blank.html with token and extract it
+
+    Returns (token, expires_in) on success, or None if failed.
     """
     if not STATE_FILE.exists():
         log.debug("No session state file — skipping silent refresh")
@@ -161,20 +191,66 @@ async def _silent_refresh() -> tuple | None:
     context = await _browser.new_context(
         storage_state=str(STATE_FILE),
         viewport=VIEWPORT,
+        user_agent=(
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+    )
+    await context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     )
     page = await context.new_page()
     try:
-        await page.goto(_oauth_url(), wait_until="domcontentloaded", timeout=20_000)
-        # Poll for 15 s
-        for _ in range(150):
+        # Step 1: Navigate to vk.com and check if logged in
+        log.info("Silent refresh: checking VK session...")
+        await page.goto("https://vk.com", wait_until="domcontentloaded", timeout=30_000)
+
+        # Check if we're on login page
+        cur_url = page.url
+        if "login.vk.com" in cur_url or "/login" in cur_url or "act=login" in cur_url:
+            log.warning("Silent refresh: VK session expired (login page) — re-auth required at /auth")
+            return None
+
+        # Verify we have remixsid cookie (logged in)
+        vk_cookies = await context.cookies(["https://vk.com"])
+        has_session = any(
+            c["name"] == "remixsid" and c.get("value", "")
+            for c in vk_cookies
+        )
+        if not has_session:
+            log.warning("Silent refresh: No remixsid cookie — re-auth required at /auth")
+            return None
+
+        log.info("Silent refresh: VK session valid, navigating to OAuth...")
+        await asyncio.sleep(1 + random.random())  # Random 1-2s delay to avoid detection
+
+        # Step 3: Navigate to OAuth URL (always revoke=1)
+        await page.goto(_oauth_url(), wait_until="domcontentloaded", timeout=15_000)
+
+        # Step 4: Wait for "Continue as ..." button
+        log.info("Silent refresh: waiting for 'Continue as' button...")
+        try:
+            await page.wait_for_selector(".vkc__LoginConnectOrPhone__connectButton", timeout=60_000)
+        except Exception as e:
+            log.warning("Silent refresh: 'Continue as' button not found within 60s: %s", e)
+            return None
+
+        # Step 5: Click button after random 1-2 second delay
+        delay = 1 + random.random()
+        log.debug("Silent refresh: clicking button after %.2fs delay", delay)
+        await asyncio.sleep(delay)
+        await page.click(".vkc__LoginConnectOrPhone__connectButton")
+
+        # Step 6: Wait for redirect to blank.html and extract token
+        log.info("Silent refresh: waiting for redirect to blank.html...")
+        for i in range(150):  # 15 seconds timeout
             await asyncio.sleep(0.1)
             result = _parse_token_url(page.url)
             if result:
+                log.info("Silent refresh: token extracted successfully")
                 return result
-            cur = page.url
-            if "login.vk.com" in cur or "/login" in cur or "act=login" in cur:
-                log.warning("Silent refresh: VK session expired — re-auth required at /auth")
-                return None
+
         log.warning("Silent refresh: timed out waiting for blank.html redirect")
         return None
     finally:
@@ -191,13 +267,23 @@ async def refresh_loop() -> None:
     await asyncio.sleep(60)
 
     while True:
-        try:
-            result = await _silent_refresh()
-            if result:
-                _save_token(*result)
-                log.info("Background token refresh OK")
-        except Exception:
-            log.exception("Background token refresh error")
+        if STATE_FILE.exists():
+            # Skip if token was written very recently (e.g. just after interactive auth)
+            age = time.time() - _last_refresh_ts
+            if _last_refresh_ts and age < 600:
+                log.info("Token is %.0fs old — skipping refresh, next in %.0fs",
+                         age, REFRESH_INTERVAL - age)
+            else:
+                log.info("Refreshing VK token...")
+                try:
+                    result = await _silent_refresh()
+                    if result:
+                        _save_token(*result)
+                        log.info("Background token refresh OK")
+                except Exception:
+                    log.exception("Background token refresh error")
+        else:
+            log.debug("No session state yet, skipping refresh")
         await asyncio.sleep(REFRESH_INTERVAL)
 
 
@@ -271,16 +357,57 @@ async def _run_auth_session(ws: web.WebSocketResponse) -> None:
             storage_state=storage,
             viewport=VIEWPORT,
             locale="ru-RU",
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+        )
+        # Remove navigator.webdriver flag that headless Chrome exposes
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         page = await context.new_page()
 
+        # Forward browser console and JS errors to server logs for debugging
+        page.on("console", lambda msg: log.info("[browser %s] %s", msg.type, msg.text))
+        page.on("pageerror", lambda err: log.warning("[browser error] %s", err))
+
         await ws.send_json({"type": "status", "message": "Opening VK login page…"})
-        await page.goto(_oauth_url(), wait_until="domcontentloaded", timeout=30_000)
+
+        # Step 1: Navigate to vk.com and wait for user to log in
+        await page.goto("https://vk.com", wait_until="domcontentloaded", timeout=30_000)
+
+        # Wait for remixsid cookie (user is logged in)
+        log.info("Interactive auth: waiting for user to log in...")
+        while not done.is_set() and not ws.closed:
+            vk_cookies = await context.cookies(["https://vk.com"])
+            has_session = any(
+                c["name"] == "remixsid" and c.get("value", "")
+                for c in vk_cookies
+            )
+            if has_session:
+                log.info("Interactive auth: user logged in")
+                await ws.send_json({"type": "status", "message": "Logged in! Redirecting to OAuth…"})
+                # Random 1-2s delay to avoid detection
+                delay = 1 + random.random()
+                await asyncio.sleep(delay)
+                break
+            await asyncio.sleep(0.5)
+
+        if not done.is_set() and not ws.closed:
+            # Step 2: Navigate to OAuth URL (always revoke=1)
+            await ws.send_json({"type": "status", "message": "Please click the button to authorize…"})
+            await page.goto(_oauth_url(), wait_until="domcontentloaded", timeout=15_000)
 
         # ── Sender task ───────────────────────────────────────────────────────
+
         async def sender() -> None:
             while not ws.closed and not done.is_set():
-                result = _parse_token_url(page.url)
+                cur_url = page.url
+
+                # Check for token in URL — auth complete
+                result = _parse_token_url(cur_url)
                 if result:
                     token, expires_in = result
                     await context.storage_state(path=str(STATE_FILE))
@@ -295,6 +422,7 @@ async def _run_auth_session(ws: web.WebSocketResponse) -> None:
                     done.set()
                     break
 
+                # Send screenshot
                 try:
                     shot = await page.screenshot(type="jpeg", quality=65, timeout=5_000)
                     await ws.send_json({"type": "frame", "data": base64.b64encode(shot).decode()})
@@ -337,7 +465,7 @@ async def _run_auth_session(ws: web.WebSocketResponse) -> None:
 # ── App lifecycle ─────────────────────────────────────────────────────────────
 
 async def startup(app: web.Application) -> None:
-    global _playwright, _browser, _session_lock
+    global _playwright, _browser, _session_lock, _last_refresh_ts
     _session_lock = asyncio.Lock()
     log.info("Launching Playwright / Chromium (headless)…")
     _playwright = await async_playwright().start()
@@ -348,13 +476,19 @@ async def startup(app: web.Application) -> None:
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--disable-extensions",
+            # Prevent VK from detecting headless Chromium and blocking login
+            "--disable-blink-features=AutomationControlled",
         ],
     )
     log.info("Chromium ready")
     asyncio.create_task(refresh_loop())
 
     if TOKEN_FILE.exists():
-        log.info("Existing token found in %s", TOKEN_FILE)
+        # Restore last-refresh timestamp from file mtime so next_refresh_in_sec
+        # is correct even after a container restart
+        _last_refresh_ts = TOKEN_FILE.stat().st_mtime
+        log.info("Existing token found in %s (mtime=%s)", TOKEN_FILE,
+                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_last_refresh_ts)))
     else:
         log.info("No token yet — visit http://localhost:%d/auth to authorize", PORT)
 
@@ -487,9 +621,9 @@ AUTH_HTML = """<!DOCTYPE html>
 
     function send(obj) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
 
-    canvas.addEventListener('click',     e => send({ type: 'click',    ...toVP(e) }));
-    canvas.addEventListener('dblclick',  e => send({ type: 'dblclick', ...toVP(e) }));
-    canvas.addEventListener('mousemove', e => send({ type: 'move',     ...toVP(e) }));
+    canvas.addEventListener('click',    e => send({ type: 'click',    ...toVP(e) }));
+    canvas.addEventListener('dblclick', e => send({ type: 'dblclick', ...toVP(e) }));
+    // mousemove intentionally not forwarded — it floods VK with tracking requests
     canvas.addEventListener('wheel', e => {
       e.preventDefault();
       send({ type: 'wheel', dx: e.deltaX, dy: e.deltaY });

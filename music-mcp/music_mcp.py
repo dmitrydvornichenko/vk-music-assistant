@@ -32,14 +32,19 @@ if log_level != "DEBUG":
 
 VK_TOKEN = os.environ.get("VK_TOKEN", "")
 
-# Hot-reload: track .vk_token file changes and update VK_TOKEN without restart
-_TOKEN_FILE = os.path.join(os.path.dirname(__file__) or ".", ".vk_token")
+# Hot-reload: watch TOKEN_FILE for changes and update VK_TOKEN without restart.
+# TOKEN_FILE env var allows Docker to point at a shared volume path (/data/.vk_token).
+# Falls back to .vk_token in the script directory for local runs.
+_TOKEN_FILE = os.environ.get(
+    "TOKEN_FILE",
+    os.path.join(os.path.dirname(__file__) or ".", ".vk_token"),
+)
 _token_file_mtime: float = 0.0
 _token_lock_reload = threading.Lock()
 
 
 def _reload_token_if_changed():
-    """Check .vk_token mtime; if changed, reload VK_TOKEN from the file."""
+    """Check TOKEN_FILE mtime; if changed, reload VK_TOKEN from the file."""
     global VK_TOKEN, _token_file_mtime, _cached_vk_user
     try:
         mtime = os.path.getmtime(_TOKEN_FILE)
@@ -56,9 +61,7 @@ def _reload_token_if_changed():
         if mtime <= _token_file_mtime:
             return
         try:
-            import json as _json
-            data = _json.loads(open(_TOKEN_FILE).read())
-            new_token = data.get("access_token", "")
+            new_token = open(_TOKEN_FILE).read().strip()
             if new_token and new_token != VK_TOKEN:
                 VK_TOKEN = new_token
                 _cached_vk_user = None  # invalidate user info cache
@@ -95,8 +98,10 @@ pause_state: dict | None = None
 playback_paused: bool = False
 
 
+# Load token from file immediately on startup (before first API call)
+_reload_token_if_changed()
 if not VK_TOKEN:
-    log.error("VK_TOKEN not set! Music service won't work.")
+    log.warning("VK_TOKEN not set — waiting for auth server to write %s", _TOKEN_FILE)
 
 mcp = FastMCP("music-server")
 
