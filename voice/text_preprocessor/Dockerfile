@@ -1,8 +1,7 @@
-FROM vasyan-ai-gpu-base:latest
+FROM ai-gpu-base:latest
 
 ENV PATH="/venv/bin:$PATH"
 
-# Зависимости для RUNorm (нормализация текста для TTS)
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install runorm torch \
  && rm -rf /tmp/*

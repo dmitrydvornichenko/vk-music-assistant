@@ -1,13 +1,10 @@
-# VK Music Assistant + голосовой ассистент (STT/LLM/TTS из vasyan-ai).
-# Ollama запускай на хосте; controller подключается по OLLAMA_BASE_URL.
-
 services:
 
   # Базовый GPU-образ для STT, TTS, text_preprocessor (CUDA 12 + Python)
   gpu-base:
     build:
       context: ./gpu-base
-    image: vasyan-ai-gpu-base:latest
+    image: ai-gpu-base:latest
 
   # ── VK Music MCP server ───────────────────────────────────────────────────
   music-mcp:
@@ -41,7 +38,7 @@ services:
     ports:
       - "${AUTH_PORT:-8080}:8080"
 
-  # ── Голосовой ассистент (vasyan-ai) ──────────────────────────────────────
+  # ── Голосовой ассистент ─────────────────────────────────────────────────────
   stt:
     build:
       context: ./voice/stt
