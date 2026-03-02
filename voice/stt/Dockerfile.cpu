@@ -1,0 +1,14 @@
+FROM python:3.10-slim
+
+RUN apt update && apt install -y \
+    ffmpeg \
+ && rm -rf /var/lib/apt/lists/* /tmp/*
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch --index-url https://download.pytorch.org/whl/cpu \
+ && pip install flask soundfile git+https://github.com/salute-developers/GigaAM.git \
+ && rm -rf /tmp/*
+
+WORKDIR /app
+COPY stt_server.py /app/
+CMD ["python", "/app/stt_server.py"]

@@ -42,21 +42,20 @@ services:
   stt:
     build:
       context: ./voice/stt
+      dockerfile: Dockerfile.gpu   # Dockerfile.cpu
     environment:
+      - LOG_LEVEL=INFO
+      - MODEL_NAME=v3_e2e_rnnt
+      - DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=0
       - CUDA_VISIBLE_DEVICES=0
-      - PULSE_SERVER=tcp:host.docker.internal:4713
-      - WHISPER_LANGUAGE=ru
-      - WHISPER_NO_SPEECH_THRESHOLD=0.7
-      - WHISPER_VAD_FILTER=true
-      - LOG_LEVEL=INFO
     deploy:
       resources:
         reservations:
           devices:
             - capabilities: [gpu]
     volumes:
-      - whisper_cache:/root/.cache
+      - stt_cache:/root/.cache
     ports:
       - "5001:5000"
     extra_hosts:
@@ -156,7 +155,7 @@ services:
 
 volumes:
   vk_data:
-  whisper_cache:
+  stt_cache:
   tts_cache:
   tts_models:
   open_webui:
