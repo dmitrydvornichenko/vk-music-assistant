@@ -373,32 +373,20 @@ async def _run_auth_session(ws: web.WebSocketResponse) -> None:
         page.on("console", lambda msg: log.info("[browser %s] %s", msg.type, msg.text))
         page.on("pageerror", lambda err: log.warning("[browser error] %s", err))
 
+        # Log 403s: VK often returns 403 when requests come from datacenter/VPN IP (the host
+        # running this container), not from the client that opened /auth.
+        def _log_failed_response(response):
+            if response.status == 403:
+                log.warning("[browser 403] %s %s", response.request.method, response.url)
+
+        page.on("response", _log_failed_response)
+
         await ws.send_json({"type": "status", "message": "Opening VK login page…"})
 
-        # Step 1: Navigate to vk.com and wait for user to log in
+        # Navigate to vk.com — on a fresh machine this shows the login form.
+        # sender/reader must already be running so the user can see and interact with the page.
         await page.goto("https://vk.com", wait_until="domcontentloaded", timeout=30_000)
-
-        # Wait for remixsid cookie (user is logged in)
         log.info("Interactive auth: waiting for user to log in...")
-        while not done.is_set() and not ws.closed:
-            vk_cookies = await context.cookies(["https://vk.com"])
-            has_session = any(
-                c["name"] == "remixsid" and c.get("value", "")
-                for c in vk_cookies
-            )
-            if has_session:
-                log.info("Interactive auth: user logged in")
-                await ws.send_json({"type": "status", "message": "Logged in! Redirecting to OAuth…"})
-                # Random 1-2s delay to avoid detection
-                delay = 1 + random.random()
-                await asyncio.sleep(delay)
-                break
-            await asyncio.sleep(0.5)
-
-        if not done.is_set() and not ws.closed:
-            # Step 2: Navigate to OAuth URL (always revoke=1)
-            await ws.send_json({"type": "status", "message": "Please click the button to authorize…"})
-            await page.goto(_oauth_url(), wait_until="domcontentloaded", timeout=15_000)
 
         # ── Sender task ───────────────────────────────────────────────────────
 
@@ -443,12 +431,37 @@ async def _run_auth_session(ws: web.WebSocketResponse) -> None:
                     break
             done.set()
 
-        sender_t = asyncio.create_task(sender())
-        reader_t = asyncio.create_task(reader())
+        # ── Login monitor task ────────────────────────────────────────────────
+        # Runs in parallel with sender/reader so the user can see the page
+        # and type credentials while we wait for the remixsid cookie to appear.
+        async def login_monitor() -> None:
+            while not done.is_set() and not ws.closed:
+                vk_cookies = await context.cookies(["https://vk.com"])
+                has_session = any(
+                    c["name"] == "remixsid" and c.get("value", "")
+                    for c in vk_cookies
+                )
+                if has_session:
+                    log.info("Interactive auth: user logged in")
+                    await ws.send_json({"type": "status", "message": "Logged in! Redirecting to OAuth…"})
+                    delay = 1 + random.random()
+                    await asyncio.sleep(delay)
+                    if not done.is_set() and not ws.closed:
+                        await ws.send_json({"type": "status", "message": "Please click the button to authorize…"})
+                        await page.goto(_oauth_url(), wait_until="domcontentloaded", timeout=15_000)
+                    return
+                await asyncio.sleep(0.5)
+
+        monitor_t = asyncio.create_task(login_monitor())
+        sender_t  = asyncio.create_task(sender())
+        reader_t  = asyncio.create_task(reader())
+        # monitor_t excluded: it completes after goto(oauth_url) and must not
+        # trigger early teardown — only sender (token found) or reader (ws closed) should.
         await asyncio.wait([sender_t, reader_t], return_when=asyncio.FIRST_COMPLETED)
         sender_t.cancel()
         reader_t.cancel()
-        await asyncio.gather(sender_t, reader_t, return_exceptions=True)
+        monitor_t.cancel()
+        await asyncio.gather(sender_t, reader_t, monitor_t, return_exceptions=True)
 
     except Exception:
         log.exception("Auth session error")

@@ -781,6 +781,7 @@ def music_health() -> dict:
     Returns:
         Dict with status, whether VK token is set, and current playback mode.
     """
+    _reload_token_if_changed()
     result = {
         "status": "ok",
         "vk_token_set": bool(VK_TOKEN),
@@ -995,6 +996,7 @@ def whoami() -> dict:
     Returns:
         Dict with id, first_name, last_name, and profile photo URL.
     """
+    _reload_token_if_changed()
     if not VK_TOKEN:
         return {"error": "VK_TOKEN is not set"}
     user = _fetch_vk_user()
@@ -1084,6 +1086,7 @@ def play_user_audio(owner_id: int = 0, shuffle: bool = False, count: int = 1000)
         shuffle: Randomise track order before queuing (default False).
         count: Maximum number of tracks to fetch (default 1000).
     """
+    _reload_token_if_changed()
     if not VK_TOKEN:
         return {"error": "VK_TOKEN is not set"}
 

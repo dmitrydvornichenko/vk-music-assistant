@@ -25,3 +25,6 @@ env/
 # Temp / build artifacts
 *.mp3
 *.tmp
+
+# Звуковые файлы (эталоны wake/stop/wait, sounds/, тесты) — не пушить
+*.wav

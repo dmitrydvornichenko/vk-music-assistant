@@ -1,4 +1,13 @@
+# VK Music Assistant + голосовой ассистент (STT/LLM/TTS из vasyan-ai).
+# Ollama запускай на хосте; controller подключается по OLLAMA_BASE_URL.
+
 services:
+
+  # Базовый GPU-образ для STT, TTS, text_preprocessor (CUDA 12 + Python)
+  gpu-base:
+    build:
+      context: ./gpu-base
+    image: vasyan-ai-gpu-base:latest
 
   # ── VK Music MCP server ───────────────────────────────────────────────────
   music-mcp:
@@ -12,9 +21,6 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - vk_data:/data
-      # Mount host PulseAudio socket — adjust the host path to match your setup:
-      #   Linux default:  /run/user/1000/pulse/native
-      #   custom:         set PULSE_SOCKET_PATH in .env
       - ${PULSE_SOCKET_PATH:-/run/user/1000/pulse/native}:/tmp/pulse-native:ro
     ports:
       - "${MCP_PORT:-8001}:8001"
@@ -28,7 +34,6 @@ services:
     environment:
       TOKEN_FILE:  /data/.vk_token
       STATE_FILE:  /data/playwright_state.json
-      # Disable .env patching inside Docker — token is shared via TOKEN_FILE
       ENV_FILE: ""
       AUTH_PORT: "8080"
     volumes:
@@ -36,7 +41,126 @@ services:
     ports:
       - "${AUTH_PORT:-8080}:8080"
 
-# Shared named volume: auth writes .vk_token + playwright_state.json here;
-# music-mcp reads .vk_token via hot-reload whenever it changes.
+  # ── Голосовой ассистент (vasyan-ai) ──────────────────────────────────────
+  stt:
+    build:
+      context: ./voice/stt
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - CUDA_VISIBLE_DEVICES=0
+      - PULSE_SERVER=tcp:host.docker.internal:4713
+      - WHISPER_LANGUAGE=ru
+      - WHISPER_NO_SPEECH_THRESHOLD=0.7
+      - WHISPER_VAD_FILTER=true
+      - LOG_LEVEL=INFO
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    volumes:
+      - whisper_cache:/root/.cache
+    ports:
+      - "5001:5000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  tts:
+    build:
+      context: ./voice/tts
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - CUDA_VISIBLE_DEVICES=0
+      - PULSE_SERVER=tcp:host.docker.internal:4713
+      - TTS_SPEAKER=xenia
+      - LOG_LEVEL=INFO
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    volumes:
+      - tts_cache:/root/.cache
+      - tts_models:/root/.local/share/tts
+    ports:
+      - "5002:5000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  text_preprocessor:
+    build:
+      context: ./voice/text_preprocessor
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - CUDA_VISIBLE_DEVICES=0
+      - PREPROCESSOR_MODEL_SIZE=big
+      - HF_HOME=/root/.cache/huggingface
+      - LOG_LEVEL=INFO
+      - TRANSFORMERS_VERBOSITY=error
+      - TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+      - HF_HUB_DISABLE_PROGRESS_BARS=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    volumes:
+      - preprocessor_cache:/root/.cache
+    ports:
+      - "5004:5000"
+
+  controller:
+    build:
+      context: ./voice/controller
+    environment:
+      - PULSE_SERVER=tcp:host.docker.internal:4713
+      - LOG_LEVEL=INFO
+      - AUDIO_RATE=16000
+      - WAKE_BUFFER_SEC=2.0
+      - COMMAND_BUFFER_SEC=2.0
+      - WAKE_SLIDE_SEC=0.25
+      - VAD_CHUNK_SIZE=512
+      - VAD_WINDOW_SIZE=8000
+      - VAD_SILENCE_CHUNKS=70
+      - MIN_RECORDING_DURATION=0.2
+      - RECORDING_GRACE_PERIOD=2.0
+      - WAKE_REFERENCE_DIR=/app/wake_ref
+      - WAKE_THRESHOLD=0.1
+      - STOP_REF_DIR=/app/stop_ref
+      - WAIT_REF_DIR=/app/wait_ref
+      - COMMAND_THRESHOLD=0.10
+      - SOUNDS_DIR=/app/sounds
+      - WEBUI_DB_PATH=/app/webui_data/webui.db
+      - VOICE_USER_ID=ec3ddb7c-ea1e-4672-a94d-7c92c9eab21e
+      # LLM на хосте: запусти Ollama и укажи URL
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - LLM_MODEL=gpt-oss:20b
+      - LLM_REASONING_EFFORT=medium
+      - HIGH_REASONING_KEYWORDS=думай,подумай
+      - FOLLOW_UP_ENABLED=true
+      - FOLLOW_UP_TIMEOUT=7.0
+      - USE_TEXT_PREPROCESSOR=true
+    volumes:
+      - ./voice/controller/wake_ref:/app/wake_ref
+      - ./voice/controller/stop_ref:/app/stop_ref
+      - ./voice/controller/wait_ref:/app/wait_ref
+      - ./sounds:/app/sounds:ro
+      - open_webui:/app/webui_data
+    ports:
+      - "5005:5000"
+    depends_on:
+      - stt
+      - tts
+      - text_preprocessor
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
 volumes:
   vk_data:
+  whisper_cache:
+  tts_cache:
+  tts_models:
+  open_webui:
+  preprocessor_cache:
