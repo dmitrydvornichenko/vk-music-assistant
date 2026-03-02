@@ -7,7 +7,7 @@ RUN apt update && apt install -y \
     python3.10 \
     python3.10-venv \
     python3-pip \
-    ffmpeg \
+    ffmpeg git \
  && rm -rf /var/lib/apt/lists/* /tmp/*
 
 RUN python3 -m venv /venv
