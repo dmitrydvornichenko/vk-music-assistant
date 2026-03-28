@@ -58,8 +58,6 @@ services:
       - stt_cache:/root/.cache
     ports:
       - "5001:5000"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
 
   tts:
     build:
@@ -67,7 +65,6 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=0
       - CUDA_VISIBLE_DEVICES=0
-      - PULSE_SERVER=tcp:host.docker.internal:4713
       - TTS_SPEAKER=xenia
       - LOG_LEVEL=INFO
     deploy:
@@ -77,11 +74,8 @@ services:
             - capabilities: [gpu]
     volumes:
       - tts_cache:/root/.cache
-      - tts_models:/root/.local/share/tts
     ports:
       - "5002:5000"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
 
   text_preprocessor:
     build:
@@ -92,8 +86,6 @@ services:
       - PREPROCESSOR_MODEL_SIZE=big
       - HF_HOME=/root/.cache/huggingface
       - LOG_LEVEL=INFO
-      - TRANSFORMERS_VERBOSITY=error
-      - TRANSFORMERS_NO_ADVISORY_WARNINGS=1
       - HF_HUB_DISABLE_PROGRESS_BARS=1
     deploy:
       resources:
@@ -159,6 +151,5 @@ volumes:
   vk_data:
   stt_cache:
   tts_cache:
-  tts_models:
   open_webui:
   preprocessor_cache:
