@@ -16,7 +16,6 @@ import tempfile
 import requests
 import wave
 import logging
-import sqlite3
 import time
 import json
 import numpy as np
@@ -117,11 +116,7 @@ RESET_PHRASES = [
 
 # Open WebUI БД для истории чатов
 WEBUI_DB_PATH = os.environ.get("WEBUI_DB_PATH", "/app/webui_data/webui.db")
-USER_ID = os.environ.get("VOICE_USER_ID", "ec3ddb7c-ea1e-4672-a94d-7c92c9eab21e")  # elestrin
-
-# Инициализация адаптера Open WebUI (автоматически загружает последний голосовой чат)
-webui_adapter = OpenWebUIAdapter(WEBUI_DB_PATH, USER_ID)
-log.info("Open WebUI DB: %s, user_id=%s, chat_id=%s", WEBUI_DB_PATH, USER_ID, webui_adapter.get_current_chat_id())
+USER_ID = os.environ.get("VOICE_USER_ID", "ec3ddb7c-ea1e-4672-a94d-7c92c9eab21e")
 
 if not pulse_server:
     print("Задай PULSE_SERVER (например tcp:host.docker.internal:4713)", file=sys.stderr)
@@ -168,6 +163,11 @@ log.info("Loaded %d reference(s): %s", len(support_set), [f for f, _ in support_
 log.info("Buffer=%d samples (%.2fs), slide=%d samples (%.2fs)", buffer_samples, BUFFER_SEC, slide_samples, SLIDE_SEC)
 log.info("Chat mode: history kept, say one of %s to reset", RESET_PHRASES[:4])
 log.info("Listening for wake word (distance < %s = trigger)...", wake_threshold)
+
+# Инициализация адаптера Open WebUI — после всех проверок окружения
+# Если БД недоступна (отдельный compose), работает в памяти без персистентности
+webui_adapter = OpenWebUIAdapter(WEBUI_DB_PATH, USER_ID)
+log.info("Chat history: db=%s available=%s chat_id=%s", WEBUI_DB_PATH, webui_adapter._db_available, webui_adapter.get_current_chat_id())
 
 # Схема инструментов MCP — загружается один раз при старте ниже после объявления функций
 _mcp_tools: list = []

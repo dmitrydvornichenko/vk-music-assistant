@@ -138,7 +138,7 @@ services:
       - ./voice/controller/stop_ref:/app/stop_ref
       - ./voice/controller/wait_ref:/app/wait_ref
       - ./sounds:/app/sounds:ro
-      - open_webui:/app/webui_data
+      - open-webui-data:/app/webui_data
     ports:
       - "5005:5000"
     depends_on:
@@ -153,5 +153,8 @@ volumes:
   vk_data:
   stt_cache:
   tts_cache:
-  open_webui:
   preprocessor_cache:
+  # Volume создаётся и управляется llama-server/docker-compose.yml
+  open-webui-data:
+    external: true
+    name: open-webui-data
