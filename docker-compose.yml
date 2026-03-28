@@ -104,7 +104,7 @@ services:
       context: ./voice/controller
     env_file: .env
     environment:
-      - PULSE_SERVER=tcp:host.docker.internal:4713
+      - PULSE_SERVER=unix:/tmp/pulse-native
       - LOG_LEVEL=INFO
       - AUDIO_RATE=16000
       - WAKE_BUFFER_SEC=2.0
@@ -133,6 +133,7 @@ services:
       - FOLLOW_UP_TIMEOUT=7.0
       - USE_TEXT_PREPROCESSOR=true
     volumes:
+      - ${PULSE_SOCKET_PATH:-/run/user/1000/pulse/native}:/tmp/pulse-native:ro
       - ./voice/controller/wake_ref:/app/wake_ref
       - ./voice/controller/stop_ref:/app/stop_ref
       - ./voice/controller/wait_ref:/app/wait_ref
@@ -141,6 +142,7 @@ services:
     ports:
       - "5005:5000"
     depends_on:
+      - music-mcp
       - stt
       - tts
       - text_preprocessor
