@@ -632,7 +632,7 @@ def on_wake_detected(skip_wake_detection=False, follow_up_timeout=None):
             resp = "Окей, новый разговор."
         else:
             webui_adapter.add_message("user", text)
-            resp = run_llm_with_tools(text)
+            resp = run_llm_with_tools()
             log.info("LLM (assistant): %d chars", len(resp or ""))
 
         if not resp:
