@@ -110,6 +110,7 @@ services:
   controller:
     build:
       context: ./voice/controller
+    env_file: .env
     environment:
       - PULSE_SERVER=tcp:host.docker.internal:4713
       - LOG_LEVEL=INFO
@@ -130,11 +131,12 @@ services:
       - SOUNDS_DIR=/app/sounds
       - WEBUI_DB_PATH=/app/webui_data/webui.db
       - VOICE_USER_ID=ec3ddb7c-ea1e-4672-a94d-7c92c9eab21e
-      # LLM на хосте: запусти Ollama и укажи URL
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - LLM_MODEL=gpt-oss:20b
-      - LLM_REASONING_EFFORT=medium
-      - HIGH_REASONING_KEYWORDS=думай,подумай
+      # MCP (music-mcp): те же инструменты что cli.py
+      - MCPO_URL=http://music-mcp:8001
+      # LLM: OpenAI-совместимый API (llama.cpp на хосте и т.д.)
+      - LLM_URL=${LLM_URL:-http://host.docker.internal:8080/v1}
+      - LLM_MODEL=${LLM_MODEL:-gpt-oss-20b-Q4_K_M.gguf}
+      - LLM_API_KEY=${LLM_API_KEY:-}
       - FOLLOW_UP_ENABLED=true
       - FOLLOW_UP_TIMEOUT=7.0
       - USE_TEXT_PREPROCESSOR=true

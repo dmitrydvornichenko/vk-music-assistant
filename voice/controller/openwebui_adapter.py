@@ -1,11 +1,13 @@
 """
 Адаптер для записи голосовых чатов в Open WebUI БД
 """
+import os
 import sqlite3
 import json
 import uuid
 import time
-from datetime import datetime
+
+_LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-oss-20b")
 
 class OpenWebUIAdapter:
     def __init__(self, db_path: str, user_id: str, auto_load_last: bool = True):
@@ -60,7 +62,7 @@ class OpenWebUIAdapter:
         chat_data = {
             "id": self.current_chat_id,
             "title": title,
-            "models": ["qwen3:14b"],
+            "models": [_LLM_MODEL],
             "params": {},
             "history": {
                 "messages": {},
@@ -107,13 +109,13 @@ class OpenWebUIAdapter:
             "role": role,
             "content": content,
             "timestamp": timestamp,
-            "models": ["qwen3:14b"] if role == "user" else None
+            "models": [_LLM_MODEL] if role == "user" else None
         }
         
         if role == "assistant":
             message.update({
-                "model": "qwen3:14b",
-                "modelName": "qwen3:14b",
+                "model": _LLM_MODEL,
+                "modelName": _LLM_MODEL,
                 "modelIdx": 0,
                 "done": True
             })
@@ -140,7 +142,7 @@ class OpenWebUIAdapter:
         chat_data = {
             "id": self.current_chat_id,
             "title": "🎤 Голосовой чат",
-            "models": ["qwen3:14b"],
+            "models": [_LLM_MODEL],
             "params": {},
             "history": {
                 "messages": self.messages,
