@@ -14,6 +14,7 @@ ENV PATH="/venv/bin:$PATH"
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip \
+ && pip install torch --index-url https://download.pytorch.org/whl/cpu \
  && pip install requests numpy local-wake silero-vad \
  && rm -rf /tmp/*
 

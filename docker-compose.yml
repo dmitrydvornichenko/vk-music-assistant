@@ -105,6 +105,7 @@ services:
     env_file: .env
     environment:
       - PULSE_SERVER=unix:/tmp/pulse-native
+      - OMP_NUM_THREADS=1
       - LOG_LEVEL=INFO
       - AUDIO_RATE=16000
       - WAKE_BUFFER_SEC=2.0
