@@ -123,6 +123,10 @@ services:
       - SOUNDS_DIR=/app/sounds
       - WEBUI_DB_PATH=/app/webui_data/webui.db
       - VOICE_USER_ID=ec3ddb7c-ea1e-4672-a94d-7c92c9eab21e
+      # URLs голосовых сервисов
+      - STT_URL=http://stt:5000
+      - TTS_URL=http://tts:5000
+      - PREP_URL=http://text_preprocessor:5000
       # MCP (music-mcp): те же инструменты что cli.py
       - MCPO_URL=http://music-mcp:8001
       # LLM: OpenAI-совместимый API (llama.cpp на хосте и т.д.)

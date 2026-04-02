@@ -68,6 +68,11 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-oss-20b-Q4_K_M.gguf")
 MCPO_URL = os.environ.get("MCPO_URL", "http://music-mcp:8001")
 MAX_LLM_ITERS = int(os.environ.get("MAX_LLM_ITERS", "6"))
 
+# URLs голосовых сервисов
+STT_URL  = os.environ.get("STT_URL",  "http://stt:5000")
+TTS_URL  = os.environ.get("TTS_URL",  "http://tts:5000")
+PREP_URL = os.environ.get("PREP_URL", "http://text_preprocessor:5000")
+
 # Follow-up mode (продолжение диалога без wake word)
 FOLLOW_UP_ENABLED = os.environ.get("FOLLOW_UP_ENABLED", "true").lower() in ("1", "true", "yes")
 FOLLOW_UP_TIMEOUT = float(os.environ.get("FOLLOW_UP_TIMEOUT", "7.0"))  # секунд после ответа
@@ -521,9 +526,14 @@ def llm_request(messages: list, tools: list) -> dict:
     return resp.json()
 
 
-def run_llm_with_tools() -> str:
+# Инструменты MCP, которые запускают воспроизведение музыки
+_MUSIC_PLAY_TOOLS = {"play_music", "play_album", "play_user_audio"}
+
+
+def run_llm_with_tools() -> tuple:
     """
-    Цикл: LLM + вызов инструментов (как cli.py). Возвращает финальный текстовый ответ для TTS.
+    Цикл: LLM + вызов инструментов (как cli.py).
+    Возвращает (response_text: str, music_started: bool).
     История уже содержит последнее сообщение пользователя (добавлено перед вызовом).
     """
     tools = get_tools()
@@ -532,6 +542,8 @@ def run_llm_with_tools() -> str:
     if SYSTEM_PROMPT.strip():
         messages.append({"role": "system", "content": SYSTEM_PROMPT.strip()})
     messages.extend(history)
+
+    music_started = False
 
     for i in range(MAX_LLM_ITERS):
         log.info("LLM request %d/%d (%d messages)", i + 1, MAX_LLM_ITERS, len(messages))
@@ -546,13 +558,15 @@ def run_llm_with_tools() -> str:
         messages.append(assistant_turn)
 
         if reason != "tool_calls" or not msg.get("tool_calls"):
-            return (msg.get("content") or "").strip()
+            return (msg.get("content") or "").strip(), music_started
 
         for tc in msg["tool_calls"]:
             func = tc["function"]
             name = func["name"]
             args = json.loads(func["arguments"])
             log.info("Tool call: %s(%s)", name, args)
+            if name in _MUSIC_PLAY_TOOLS:
+                music_started = True
             try:
                 result = tool_request(name, args)
             except Exception as e:
@@ -563,7 +577,7 @@ def run_llm_with_tools() -> str:
                 "content": result,
             })
     log.warning("Max LLM iterations reached")
-    return (messages[-1].get("content") or "").strip()
+    return (messages[-1].get("content") or "").strip(), music_started
 
 
 def on_wake_detected(skip_wake_detection=False, follow_up_timeout=None):
@@ -611,10 +625,9 @@ def on_wake_detected(skip_wake_detection=False, follow_up_timeout=None):
     reply_path = tempfile.mktemp(suffix=".wav")
     try:
         save_wav(audio, wav_path)
-        play_notification("end")  # Звук "записали, обрабатываем"
-        log.info("STT: sending %d bytes to http://stt:5000/stt", os.path.getsize(wav_path))
+        log.info("STT: sending %d bytes to %s/stt", os.path.getsize(wav_path), STT_URL)
         with open(wav_path, "rb") as f:
-            r = requests.post("http://stt:5000/stt", files={"audio": f}, timeout=30)
+            r = requests.post(f"{STT_URL}/stt", files={"audio": f}, timeout=30)
         r.raise_for_status()
         text = r.json().get("text", "").strip()
         log.info("STT (user): %r", text or "(empty)")
@@ -622,7 +635,6 @@ def on_wake_detected(skip_wake_detection=False, follow_up_timeout=None):
         if not text:
             log.warning("Empty text from STT, skipping LLM/TTS")
             return "empty"
-        
 
         # Сброс контекста по фразе
         if is_reset_phrase(text):
@@ -630,42 +642,49 @@ def on_wake_detected(skip_wake_detection=False, follow_up_timeout=None):
             webui_adapter.create_new_chat()
             log.info("Chat reset: old chat had %d msgs, new chat_id=%s", old_count, webui_adapter.get_current_chat_id())
             resp = "Окей, новый разговор."
+            music_started = False
         else:
             webui_adapter.add_message("user", text)
-            resp = run_llm_with_tools()
-            log.info("LLM (assistant): %d chars", len(resp or ""))
+            resp, music_started = run_llm_with_tools()
+            log.info("LLM (assistant): %d chars, music_started=%s", len(resp or ""), music_started)
+
+        # Музыка запущена — не озвучиваем и не пищим, просто играет
+        if music_started:
+            log.info("Music started — skipping TTS and notifications")
+            webui_adapter.add_message("assistant", resp or "")
+            return "music_playing"
 
         if not resp:
             log.warning("Empty LLM response, skipping TTS")
             return "empty"
 
-        # Препроцессинг текста перед TTS (опционально)
-        # ВАЖНО: финальный текст (после препроцессора) сохраняем в БД для дебага
+        # Звук "записали, обрабатываем" — только для разговорных ответов
+        play_notification("end")
+
+        # Препроцессинг текста перед TTS
         tts_text = resp
         if USE_TEXT_PREPROCESSOR:
-            log.info("Text Preprocessor: sending %d chars to http://text_preprocessor:5000/preprocess", len(resp))
+            log.info("Text Preprocessor: sending %d chars to %s", len(resp), PREP_URL)
             try:
                 r = requests.post(
-                    "http://text_preprocessor:5000/preprocess",
+                    f"{PREP_URL}/preprocess",
                     json={"text": resp, "add_ssml": True},
                     timeout=60
                 )
                 r.raise_for_status()
                 tts_text = r.json().get("processed_text", resp)
-                log.info("Text Preprocessor: processed %d → %d chars", len(resp), len(tts_text))
+                log.info("Text Preprocessor: %d → %d chars", len(resp), len(tts_text))
             except Exception as e:
                 log.warning("Text Preprocessor failed: %s, using original text", e)
                 tts_text = resp
-        
-        # Сохраняем в БД финальный текст (который реально идет в TTS)
-        webui_adapter.add_message("assistant", tts_text)
-        total_msgs = webui_adapter.get_message_count()
-        log.info("Saved to DB: %d chars, total %d msgs in chat", len(tts_text), total_msgs)
 
-        log.info("TTS: sending %d chars to http://tts:5000/tts", len(tts_text))
-        # TTS синтез занимает ~1 сек на 10 символов, +запас. Для 1000 символов = 100+ сек
-        tts_timeout = max(120, len(tts_text) // 5)  # минимум 2 мин, или 1 сек на 5 символов
-        r = requests.post("http://tts:5000/tts", json={"text": tts_text}, timeout=tts_timeout)
+        # Сохраняем оригинальный ответ LLM в историю, а не препроцессированный
+        webui_adapter.add_message("assistant", resp)
+        log.info("Saved to DB: %d msgs in chat", webui_adapter.get_message_count())
+
+        log.info("TTS: sending %d chars to %s", len(tts_text), TTS_URL)
+        tts_timeout = max(120, len(tts_text) // 5)
+        r = requests.post(f"{TTS_URL}/tts", json={"text": tts_text}, timeout=tts_timeout)
         r.raise_for_status()
         with open(reply_path, "wb") as f:
             f.write(r.content)
@@ -733,21 +752,20 @@ def main():
                                 proc.kill()
                             
                             result = on_wake_detected(skip_wake_detection=False)
+                            # follow-up только для разговорных ответов; музыка — без follow-up
                             if FOLLOW_UP_ENABLED and result in ("success", "stopped"):
                                 while True:
-                                    # Сразу запускаем запись с таймаутом (пилик сыграет после инициализации parec)
                                     result2 = on_wake_detected(skip_wake_detection=True, follow_up_timeout=FOLLOW_UP_TIMEOUT)
-                                    
                                     if result2 == "success":
                                         continue
+                                    if result2 == "music_playing":
+                                        log.info("Music started in follow-up — returning to wake word mode")
+                                        break
                                     if result2 == "timeout":
-                                        # Таймаут - выход из follow-up
                                         log.info("Follow-up timeout → returning to wake word mode")
                                         play_notification("exit")
                                         break
-                                    
                                     else:
-                                        # Другие случаи (empty, error) - выход
                                         log.info("Follow-up ended: %s", result2)
                                         play_notification("exit")
                                         break
