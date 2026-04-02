@@ -14,11 +14,17 @@ ENV PATH="/venv/bin:$PATH"
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip \
- && pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu \
- && pip install requests numpy local-wake silero-vad \
+ && pip install requests numpy local-wake onnxruntime \
  && rm -rf /tmp/*
 
-WORKDIR /app
-COPY main.py openwebui_adapter.py /app/
-CMD ["python","/app/main.py"]
+# Скачиваем ONNX-модель Silero VAD один раз при сборке образа
+RUN python -c "\
+import urllib.request; \
+urllib.request.urlretrieve(\
+  'https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx', \
+  '/silero_vad.onnx'\
+)"
 
+WORKDIR /app
+COPY main.py openwebui_adapter.py vad_onnx.py /app/
+CMD ["python","/app/main.py"]

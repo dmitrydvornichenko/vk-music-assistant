@@ -19,7 +19,7 @@ import logging
 import time
 import json
 import numpy as np
-from silero_vad import load_silero_vad, get_speech_timestamps
+from vad_onnx import load_silero_vad, get_speech_timestamps
 from openwebui_adapter import OpenWebUIAdapter
 
 # Настройка уровня логирования из переменной окружения
